@@ -1,5 +1,5 @@
 /*
- * Copyright 2002-2018 the original author or authors.
+ * Copyright 2002-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
 import org.springframework.core.annotation.AnnotationUtils;
+import org.springframework.lang.Nullable;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.ContextConfigurationAttributes;
 import org.springframework.test.context.ContextHierarchy;
@@ -150,8 +151,8 @@ abstract class ContextLoaderUtils {
 			}
 
 			hierarchyAttributes.add(0, configAttributesList);
-			desc = findAnnotationDescriptorForTypes(
-					rootDeclaringClass.getSuperclass(), contextConfigType, contextHierarchyType);
+
+			desc = desc.next();
 		}
 
 		return hierarchyAttributes;
@@ -182,7 +183,7 @@ abstract class ContextLoaderUtils {
 	 * @see #resolveContextHierarchyAttributes(Class)
 	 */
 	static Map<String, List<ContextConfigurationAttributes>> buildContextHierarchyMap(Class<?> testClass) {
-		final Map<String, List<ContextConfigurationAttributes>> map = new LinkedHashMap<>();
+		Map<String, List<ContextConfigurationAttributes>> map = new LinkedHashMap<>();
 		int hierarchyLevel = 1;
 
 		for (List<ContextConfigurationAttributes> configAttributesList : resolveContextHierarchyAttributes(testClass)) {
@@ -237,21 +238,25 @@ abstract class ContextLoaderUtils {
 	static List<ContextConfigurationAttributes> resolveContextConfigurationAttributes(Class<?> testClass) {
 		Assert.notNull(testClass, "Class must not be null");
 
-		List<ContextConfigurationAttributes> attributesList = new ArrayList<>();
 		Class<ContextConfiguration> annotationType = ContextConfiguration.class;
-
 		AnnotationDescriptor<ContextConfiguration> descriptor = findAnnotationDescriptor(testClass, annotationType);
 		Assert.notNull(descriptor, () -> String.format(
 					"Could not find an 'annotation declaring class' for annotation type [%s] and class [%s]",
 					annotationType.getName(), testClass.getName()));
 
-		while (descriptor != null) {
+		List<ContextConfigurationAttributes> attributesList = new ArrayList<>();
+		resolveContextConfigurationAttributes(attributesList, descriptor);
+		return attributesList;
+	}
+
+	private static void resolveContextConfigurationAttributes(List<ContextConfigurationAttributes> attributesList,
+			@Nullable AnnotationDescriptor<ContextConfiguration> descriptor) {
+
+		if (descriptor != null) {
 			convertContextConfigToConfigAttributesAndAddToList(descriptor.synthesizeAnnotation(),
 					descriptor.getRootDeclaringClass(), attributesList);
-			descriptor = findAnnotationDescriptor(descriptor.getRootDeclaringClass().getSuperclass(), annotationType);
+			resolveContextConfigurationAttributes(attributesList, descriptor.next());
 		}
-
-		return attributesList;
 	}
 
 	/**
@@ -260,7 +265,7 @@ abstract class ContextLoaderUtils {
 	 * declaring class and then adding the attributes to the supplied list.
 	 */
 	private static void convertContextConfigToConfigAttributesAndAddToList(ContextConfiguration contextConfiguration,
-			Class<?> declaringClass, final List<ContextConfigurationAttributes> attributesList) {
+			Class<?> declaringClass, List<ContextConfigurationAttributes> attributesList) {
 
 		if (logger.isTraceEnabled()) {
 			logger.trace(String.format("Retrieved @ContextConfiguration [%s] for declaring class [%s].",

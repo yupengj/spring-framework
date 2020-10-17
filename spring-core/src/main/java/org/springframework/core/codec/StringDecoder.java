@@ -1,5 +1,5 @@
 /*
- * Copyright 2002-2019 the original author or authors.
+ * Copyright 2002-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,6 +72,8 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 
 	private final boolean stripDelimiter;
 
+	private Charset defaultCharset = DEFAULT_CHARSET;
+
 	private final ConcurrentMap<Charset, byte[][]> delimitersCache = new ConcurrentHashMap<>();
 
 
@@ -80,6 +82,25 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 		Assert.notEmpty(delimiters, "'delimiters' must not be empty");
 		this.delimiters = new ArrayList<>(delimiters);
 		this.stripDelimiter = stripDelimiter;
+	}
+
+
+	/**
+	 * Set the default character set to fall back on if the MimeType does not specify any.
+	 * <p>By default this is {@code UTF-8}.
+	 * @param defaultCharset the charset to fall back on
+	 * @since 5.2.9
+	 */
+	public void setDefaultCharset(Charset defaultCharset) {
+		this.defaultCharset = defaultCharset;
+	}
+
+	/**
+	 * Return the configured {@link #setDefaultCharset(Charset) defaultCharset}.
+	 * @since 5.2.9
+	 */
+	public Charset getDefaultCharset() {
+		return this.defaultCharset;
 	}
 
 
@@ -94,20 +115,18 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 
 		byte[][] delimiterBytes = getDelimiterBytes(mimeType);
 
-		// TODO: Drop Consumer and use bufferUntil with Supplier<LimistedDataBufferList> (reactor-core#1925)
-		// TODO: Drop doOnDiscard(LimitedDataBufferList.class, ...) (reactor-core#1924)
-		LimitedDataBufferConsumer limiter = new LimitedDataBufferConsumer(getMaxInMemorySize());
-
 		Flux<DataBuffer> inputFlux = Flux.defer(() -> {
 			DataBufferUtils.Matcher matcher = DataBufferUtils.matcher(delimiterBytes);
+
+			@SuppressWarnings("MismatchedQueryAndUpdateOfCollection")
+			LimitChecker limiter = new LimitChecker(getMaxInMemorySize());
+
 			return Flux.from(input)
 					.concatMapIterable(buffer -> endFrameAfterDelimiter(buffer, matcher))
 					.doOnNext(limiter)
 					.bufferUntil(buffer -> buffer instanceof EndFrameBuffer)
-					.map(buffers -> joinAndStrip(buffers, this.stripDelimiter))
-					.doOnDiscard(LimitedDataBufferList.class, LimitedDataBufferList::releaseAndClear)
+					.map(list -> joinAndStrip(list, this.stripDelimiter))
 					.doOnDiscard(PooledDataBuffer.class, DataBufferUtils::release);
-
 		});
 
 		return super.decode(inputFlux, elementType, mimeType, hints);
@@ -138,18 +157,17 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 		return value;
 	}
 
-	private static Charset getCharset(@Nullable MimeType mimeType) {
+	private Charset getCharset(@Nullable MimeType mimeType) {
 		if (mimeType != null && mimeType.getCharset() != null) {
 			return mimeType.getCharset();
 		}
 		else {
-			return DEFAULT_CHARSET;
+			return getDefaultCharset();
 		}
 	}
 
 	/**
 	 * Finds the first match and longest delimiter, {@link EndFrameBuffer} just after it.
-	 *
 	 * @param dataBuffer the buffer to find delimiters in
 	 * @param matcher used to find the first delimiters
 	 * @return a flux of buffers, containing {@link EndFrameBuffer} after each delimiter that was
@@ -158,23 +176,27 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 	 */
 	private static List<DataBuffer> endFrameAfterDelimiter(DataBuffer dataBuffer, DataBufferUtils.Matcher matcher) {
 		List<DataBuffer> result = new ArrayList<>();
-		do {
-			int endIdx = matcher.match(dataBuffer);
-			if (endIdx != -1) {
-				int readPosition = dataBuffer.readPosition();
-				int length = endIdx - readPosition + 1;
-				result.add(dataBuffer.retainedSlice(readPosition, length));
-				result.add(new EndFrameBuffer(matcher.delimiter()));
-				dataBuffer.readPosition(endIdx + 1);
+		try {
+			do {
+				int endIdx = matcher.match(dataBuffer);
+				if (endIdx != -1) {
+					int readPosition = dataBuffer.readPosition();
+					int length = (endIdx - readPosition + 1);
+					DataBuffer slice = dataBuffer.retainedSlice(readPosition, length);
+					result.add(slice);
+					result.add(new EndFrameBuffer(matcher.delimiter()));
+					dataBuffer.readPosition(endIdx + 1);
+				}
+				else {
+					result.add(DataBufferUtils.retain(dataBuffer));
+					break;
+				}
 			}
-			else {
-				result.add(DataBufferUtils.retain(dataBuffer));
-				break;
-			}
+			while (dataBuffer.readableByteCount() > 0);
 		}
-		while (dataBuffer.readableByteCount() > 0);
-
-		DataBufferUtils.release(dataBuffer);
+		finally {
+			DataBufferUtils.release(dataBuffer);
+		}
 		return result;
 	}
 
@@ -186,9 +208,7 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 	 * @param stripDelimiter whether to strip the delimiter
 	 * @return the joined buffer
 	 */
-	private static DataBuffer joinAndStrip(List<DataBuffer> dataBuffers,
-			boolean stripDelimiter) {
-
+	private static DataBuffer joinAndStrip(List<DataBuffer> dataBuffers, boolean stripDelimiter) {
 		Assert.state(!dataBuffers.isEmpty(), "DataBuffers should not be empty");
 
 		byte[] matchingDelimiter = null;
@@ -201,7 +221,6 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 		}
 
 		DataBuffer result = dataBuffers.get(0).factory().join(dataBuffers);
-
 		if (stripDelimiter && matchingDelimiter != null) {
 			result.writePosition(result.writePosition() - matchingDelimiter.length);
 		}
@@ -209,16 +228,14 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 	}
 
 
-
-
 	/**
 	 * Create a {@code StringDecoder} for {@code "text/plain"}.
-	 * @param ignored ignored
+	 * @param stripDelimiter this flag is ignored
 	 * @deprecated as of Spring 5.0.4, in favor of {@link #textPlainOnly()} or
 	 * {@link #textPlainOnly(List, boolean)}
 	 */
 	@Deprecated
-	public static StringDecoder textPlainOnly(boolean ignored) {
+	public static StringDecoder textPlainOnly(boolean stripDelimiter) {
 		return textPlainOnly();
 	}
 
@@ -241,12 +258,12 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 
 	/**
 	 * Create a {@code StringDecoder} that supports all MIME types.
-	 * @param ignored ignored
+	 * @param stripDelimiter this flag is ignored
 	 * @deprecated as of Spring 5.0.4, in favor of {@link #allMimeTypes()} or
 	 * {@link #allMimeTypes(List, boolean)}
 	 */
 	@Deprecated
-	public static StringDecoder allMimeTypes(boolean ignored) {
+	public static StringDecoder allMimeTypes(boolean stripDelimiter) {
 		return allMimeTypes();
 	}
 
@@ -271,10 +288,9 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 
 	private static class EndFrameBuffer extends DataBufferWrapper {
 
-		private static final DataBuffer BUFFER = new DefaultDataBufferFactory().wrap(new byte[0]);
+		private static final DataBuffer BUFFER = DefaultDataBufferFactory.sharedInstance.wrap(new byte[0]);
 
-		private byte[] delimiter;
-
+		private final byte[] delimiter;
 
 		public EndFrameBuffer(byte[] delimiter) {
 			super(BUFFER);
@@ -284,38 +300,31 @@ public final class StringDecoder extends AbstractDataBufferDecoder<String> {
 		public byte[] delimiter() {
 			return this.delimiter;
 		}
-
 	}
 
 
-	/**
-	 * Temporary measure for reactor-core#1925.
-	 * Consumer that adds to a {@link LimitedDataBufferList} to enforce limits.
-	 */
-	private static class LimitedDataBufferConsumer implements Consumer<DataBuffer> {
+	private static class LimitChecker implements Consumer<DataBuffer> {
 
-		private final LimitedDataBufferList bufferList;
+		@SuppressWarnings("MismatchedQueryAndUpdateOfCollection")
+		private final LimitedDataBufferList list;
 
-
-		public LimitedDataBufferConsumer(int maxInMemorySize) {
-			this.bufferList = new LimitedDataBufferList(maxInMemorySize);
+		LimitChecker(int maxInMemorySize) {
+			this.list = new LimitedDataBufferList(maxInMemorySize);
 		}
-
 
 		@Override
 		public void accept(DataBuffer buffer) {
 			if (buffer instanceof EndFrameBuffer) {
-				this.bufferList.clear();
+				this.list.clear();
 			}
-			else {
-				try {
-					this.bufferList.add(buffer);
-				}
-				catch (DataBufferLimitException ex) {
-					DataBufferUtils.release(buffer);
-					throw ex;
-				}
+			try {
+				this.list.add(buffer);
+			}
+			catch (DataBufferLimitException ex) {
+				DataBufferUtils.release(buffer);
+				throw ex;
 			}
 		}
 	}
+
 }
